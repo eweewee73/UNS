@@ -1,0 +1,213 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Calibri;}{\f1 Consolas;}}
+\viewkind4\uc1
+\pard\qc\sa240\b\fs36 Small-Scale Unified Namespace (UNS)\par
+\fs28 Architecture and Step-by-Step Deployment Guide\par
+\b0\fs20\par
+\pard\sa120 Version 1.0\par
+Date: 17 September 2026\par
+Target repository: eweewee73/UNS\par
+\par
+\pard\sa240\b\fs26 1. Executive Summary\par
+\b0 This document describes a small-scale Unified Namespace (UNS) deployment that publishes normalized real-time data from TDengine and PostgreSQL through an MQTT broker. The design is intended for a single site, laboratory, pilot line, or small production environment. It uses open-source components and can run on one Linux virtual machine or physical server using Docker Compose.\par
+\par
+The UNS is the MQTT topic hierarchy and event distribution layer. TDengine remains the authoritative store for time-series history, while PostgreSQL remains the authoritative store for business and master data. MQTT retained messages represent current state; historical data is not copied wholesale into MQTT.\par
+\par
+\pard\sa240\b\fs26 2. Scope and Assumptions\par
+\b0\tab - One site or factory.\par
+\tab - Up to several hundred assets and moderate telemetry volume.\par
+\tab - One MQTT broker with local persistence.\par
+\tab - TDengine and PostgreSQL already exist or are deployed separately.\par
+\tab - Connector services use polling initially; PostgreSQL CDC can be added later.\par
+\tab - Consumers include Grafana, Node-RED, and custom MQTT subscribers.\par
+\tab - All timestamps are UTC.\par
+\par
+\pard\sa240\b\fs26 3. Logical Architecture\par
+\b0\f1\fs18
++------------------+       +------------------+\par
+| TDengine         |       | PostgreSQL       |\par
+| telemetry/history|       | business/master  |\par
++--------+---------+       +---------+--------+\par
+         | SQL/client API             | SQL/polling or CDC\par
+         v                           v\par
++--------+---------+       +---------+--------+\par
+| TDengine reader |       | PostgreSQL reader|\par
+| Python or Go    |       | Python or Go     |\par
++--------+---------+       +---------+--------+\par
+         \             /\par
+          v           v\par
+        +---------------+\par
+        | Normalize and |\par
+        | route         |\par
+        | Node-RED or   |\par
+        | connector code|\par
+        +-------+-------+\par
+                | publish QoS 1\par
+                v\par
+        +-------+-------+\par
+        | MQTT broker   |\par
+        | Mosquitto or  |\par
+        | EMQX          |\par
+        +---+---+---+---+\par
+            |   |   |\par
+            v   v   v\par
+       Grafana Apps Node-RED\par
+\f0\fs20\par
+\pard\sa120 The connectors read source data, apply the UNS information model, and publish messages. A checkpoint store prevents data loss or excessive duplication after restarts.\par
+\par
+\pard\sa240\b\fs26 4. Recommended Components\par
+\b0\tab - MQTT broker: Mosquitto for the simplest deployment, or EMQX when management, clustering, and rules are needed.\par
+\tab - TDengine connector: Python or Go using an official TDengine client, JDBC, or REST interface.\par
+\tab - PostgreSQL connector: Python psycopg, Go, or Debezium when low-latency CDC is required.\par
+\tab - Transformation: connector code for a controlled deployment; Node-RED for visual flows and simple routing.\par
+\tab - Checkpointing: SQLite for a single connector host; PostgreSQL for shared or multi-service checkpoints.\par
+\tab - Visualization: Grafana querying TDengine/PostgreSQL for history and subscribing to MQTT for current state where appropriate.\par
+\tab - Packaging: Docker Compose on Linux.\par
+\par
+\pard\sa240\b\fs26 5. Network and Security Design\par
+\b0 Place the broker and connectors on a private application network. Permit inbound MQTT only from approved clients. Permit connector-to-database traffic only to the required database hosts and ports. Use TLS for MQTT outside a trusted local network, unique credentials per client, and topic ACLs. Do not expose TDengine or PostgreSQL directly to the public internet.\par
+\par
+Suggested ports:\par
+\tab - MQTT: 1883 internal only; 8883 MQTT over TLS.\par
+\tab - PostgreSQL: 5432, restricted to connector and administrative networks.\par
+\tab - TDengine: use the port required by the selected client/API; restrict it to the connector network.\par
+\tab - Grafana: 3000, restricted to the operations network or protected by a reverse proxy.\par
+\par
+\pard\sa240\b\fs26 6. UNS Topic and Payload Model\par
+\b0 Use stable business and asset-oriented topics rather than exposing database table names. Example hierarchy:\par
+\f1\fs18 acme/factory-01/line-01/machine-01/temperature\par
+acme/factory-01/line-01/machine-01/state\par
+acme/factory-01/events/alarms\par
+acme/business/workorders/WO-1001\par
+acme/master/equipment/machine-01\par
+\f0\fs20\par
+Example telemetry payload:\par
+\f1\fs18 {\par
+  "value": 72.4,\par
+  "unit": "degC",\par
+  "timestamp": "2026-09-17T12:30:00Z",\par
+  "quality": "good",\par
+  "source": "tdengine",\par
+  "asset": "machine-01",\par
+  "schemaVersion": "1.0"\par
+}\par
+\f0\fs20\par
+Use retained messages for current state and QoS 1 for important updates. Do not retain unlimited high-frequency history in the broker. Consumers must tolerate duplicates and out-of-order messages.\par
+\par
+\pard\sa240\b\fs26 7. Step-by-Step Deployment\par
+\b\fs22 Step 1 - Prepare the host\par
+\b0 Install a supported Linux distribution, Docker Engine, and Docker Compose. Allocate approximately 2 CPU cores, 4 GB RAM, and 30 GB of disk for an initial pilot. Use a static hostname such as uns-server and synchronize time with NTP.\par
+\par
+\b\fs22 Step 2 - Create the deployment directory\par
+\b0\f1\fs18 mkdir -p /opt/uns/{mosquitto/config,mosquitto/data,mosquitto/log,grafana,connectors,checkpoints}\par
+cd /opt/uns\par
+\f0\fs20\par
+\b\fs22 Step 3 - Create a Docker Compose stack\par
+\b0 Create docker-compose.yml with the following starting point. Replace image versions with versions approved by your operations process.\par
+\f1\fs16 version: '3.8'\par
+services:\par
+  mqtt:\par
+    image: eclipse-mosquitto:2\par
+    container_name: uns-mqtt\par
+    restart: unless-stopped\par
+    ports:\par
+      - "1883:1883"\par
+    volumes:\par
+      - ./mosquitto/config:/mosquitto/config\par
+      - ./mosquitto/data:/mosquitto/data\par
+      - ./mosquitto/log:/mosquitto/log\par
+\par
+  grafana:\par
+    image: grafana/grafana-oss:latest\par
+    container_name: uns-grafana\par
+    restart: unless-stopped\par
+    ports:\par
+      - "3000:3000"\par
+    volumes:\par
+      - grafana-data:/var/lib/grafana\par
+\par
+volumes:\par
+  grafana-data:\par
+\f0\fs20\par
+Run docker compose up -d after the configuration files are created. For production, pin exact image tags instead of using latest.\par
+\par
+\b\fs22 Step 4 - Configure Mosquitto\par
+\b0 Create mosquitto/config/mosquitto.conf:\par
+\f1\fs16 listener 1883\par
+allow_anonymous false\par
+password_file /mosquitto/config/passwordfile\par
+persistence true\par
+persistence_location /mosquitto/data/\par
+log_dest stdout\par
+\f0\fs20\par
+Create a password file using mosquitto_passwd, then restart the broker. For production, configure TLS on port 8883 and create ACL rules so each connector and consumer can access only its required topic branches.\par
+\par
+\b\fs22 Step 5 - Verify the broker\par
+\b0 Use one terminal to subscribe and another to publish a test message:\par
+\f1\fs16 mosquitto_sub -h localhost -p 1883 -u test -P 'password' -t 'acme/#' -v\par
+mosquitto_pub -h localhost -p 1883 -u test -P 'password' -t 'acme/test/health' -m '{"status":"ok"}' -q 1\par
+\f0\fs20 Confirm that the subscriber receives the message.\par
+\par
+\b\fs22 Step 6 - Build the TDengine reader\par
+\b0 Implement a small service that: connects with a read-only account; queries rows after the last checkpoint; orders by timestamp; maps each asset and measurement to a topic; publishes normalized JSON with QoS 1; and updates the checkpoint only after successful publication. Persist both timestamp and a tie-breaker when timestamps are not unique. Use exponential backoff for database and broker reconnects.\par
+\par
+A typical query pattern is:\par
+\f1\fs16 SELECT ts, device_id, temperature\par
+FROM telemetry\par
+WHERE ts > :last_timestamp\par
+ORDER BY ts\par
+LIMIT 1000;\par
+\f0\fs20\par
+\b\fs22 Step 7 - Build the PostgreSQL reader\par
+\b0 For polling, add an indexed updated_at column and query changed rows:\par
+\f1\fs16 SELECT id, status, updated_at\par
+FROM work_orders\par
+WHERE updated_at > :last_updated_at\par
+ORDER BY updated_at, id\par
+LIMIT 1000;\par
+\f0\fs20\par
+For near-real-time business events, use PostgreSQL logical replication with a CDC tool such as Debezium. Transform CDC records into business-oriented topics rather than publishing raw table and column names. LISTEN/NOTIFY may be used as a trigger to re-read a row, but should not be the only durable event mechanism.\par
+\par
+\b\fs22 Step 8 - Add checkpointing and error handling\par
+\b0 Store connector name, source, last timestamp or source position, and update time. Write checkpoints atomically. Send malformed records and unrecoverable publish failures to an error topic or durable error table. Make consumers idempotent because QoS 1 can deliver duplicates.\par
+\par
+\b\fs22 Step 9 - Connect Grafana\par
+\b0 Add TDengine and PostgreSQL data sources for historical dashboards. Use MQTT integration or a small MQTT-to-metrics bridge for current-state panels if required. Keep dashboard queries bounded by time range and use read-only database credentials.\par
+\par
+\b\fs22 Step 10 - Add operational monitoring\par
+\b0 Monitor broker uptime, connector process health, database connection status, publish failures, message rate, checkpoint age, disk usage, and time since last source update. Configure container restart policies and alert when a connector has not advanced its checkpoint within the expected interval.\par
+\par
+\pard\sa240\b\fs26 8. Validation Checklist\par
+\b0\tab [ ] Test messages can be published and received.\par
+\tab [ ] TDengine data appears on the expected topic.\par
+\tab [ ] PostgreSQL changes appear within the required latency.\par
+\tab [ ] Timestamps are UTC and source timestamps are preserved.\par
+\tab [ ] Units, quality, asset IDs, and schema versions are present.\par
+\tab [ ] Restarting a connector resumes from its checkpoint.\par
+\tab [ ] Duplicate messages do not corrupt consumer state.\par
+\tab [ ] Invalid records are visible in an error path.\par
+\tab [ ] Credentials are not stored in source code or committed to Git.\par
+\tab [ ] MQTT ACLs prevent unauthorized topic access.\par
+\tab [ ] Database history remains queryable independently of MQTT.\par
+\par
+\pard\sa240\b\fs26 9. Backup and Recovery\par
+\b0 Back up Mosquitto persistence data if retained state is important, connector checkpoint databases, configuration files, ACLs, TLS keys, and Grafana provisioning and dashboards. Test restoration on a separate host. Treat TDengine and PostgreSQL backup and retention as separate source-system responsibilities.\par
+\par
+\pard\sa240\b\fs26 10. Troubleshooting\par
+\b\fs22 No messages are visible\par
+\b0 Check connector logs, broker authentication, topic spelling, ACLs, source database connectivity, and whether the source query returns rows. Subscribe to the precise topic and then to the relevant branch using a wildcard.\par
+\par
+\b\fs22 Messages stop after restart\par
+\b0 Inspect the checkpoint value and compare it with the newest source timestamp. Check for non-unique timestamps, timezone conversion errors, and a checkpoint written before a successful publish.\par
+\par
+\b\fs22 Duplicate or out-of-order messages\par
+\b0 This is expected in many distributed systems. Include source timestamps or sequence numbers and make consumers idempotent. Do not use MQTT arrival time as the business event time.\par
+\par
+\b\fs22 Broker disk grows unexpectedly\par
+\b0 Review retained messages, persistent sessions, queue limits, and client subscriptions. Avoid retaining high-frequency historical telemetry and set explicit message and storage policies.\par
+\par
+\pard\sa240\b\fs26 11. Future Scaling\par
+\b0 When volume or availability requirements grow, move from one broker to a clustered EMQX deployment, use multiple connector instances with partitioned assets, replace polling with PostgreSQL CDC where useful, externalize checkpoints to a highly available database, add schema validation and a registry, and introduce centralized metrics, logs, secrets management, and backup automation.\par
+\par
+\pard\qc\sa240\b\fs22 End of document\par
+}
